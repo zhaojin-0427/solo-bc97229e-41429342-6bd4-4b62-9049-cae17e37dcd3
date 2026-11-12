@@ -95,7 +95,84 @@ CREATE TABLE IF NOT EXISTS batches (
     FOREIGN KEY (center_id) REFERENCES centers (center_id)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_center ON batches (center_id);
+
+-- Background backfill jobs. The cursor plus the per-page batch rows are the
+-- whole durable state: on restart the worker resumes at ``cursor`` and every
+-- already-committed page is visible as a normal batch.
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    job_id               TEXT PRIMARY KEY,
+    center_id            TEXT NOT NULL,
+    original_study_uid   TEXT NOT NULL,
+    source_base_url      TEXT NOT NULL,
+    page_size            INTEGER NOT NULL DEFAULT 5,
+    status               TEXT NOT NULL CHECK (
+        status IN ('queued', 'running', 'paused', 'completed', 'failed')
+    ),
+    cursor               TEXT NOT NULL DEFAULT '',
+    pages_committed      INTEGER NOT NULL DEFAULT 0,
+    instances_committed  INTEGER NOT NULL DEFAULT 0,
+    instances_reused     INTEGER NOT NULL DEFAULT 0,
+    last_batch_id        TEXT,
+    last_error_code      TEXT,
+    last_error_message   TEXT,
+    last_error_at        TEXT,
+    runner_token         TEXT,
+    runner_started_at    TEXT,
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (center_id, original_study_uid),
+    FOREIGN KEY (center_id) REFERENCES centers (center_id)
+);
+CREATE INDEX IF NOT EXISTS idx_backfill_status ON backfill_jobs (status);
+
+-- One row per page attempt, including failed ones, so operators can inspect
+-- the error history without polluting the jobs table.
+CREATE TABLE IF NOT EXISTS backfill_job_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    page_no         INTEGER NOT NULL,
+    cursor          TEXT NOT NULL,
+    outcome         TEXT NOT NULL CHECK (
+        outcome IN ('committed', 'paused', 'failed')
+    ),
+    error_code      TEXT,
+    error_message   TEXT,
+    batch_id        TEXT,
+    item_count      INTEGER,
+    reused_count    INTEGER,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (job_id) REFERENCES backfill_jobs (job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_backfill_attempts_job
+    ON backfill_job_attempts (job_id, id);
 """
+
+# Columns added after the first release; applied idempotently so databases
+# created by an older image keep working after an upgrade.
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "batches": [
+        ("origin_kind", "TEXT NOT NULL DEFAULT 'upload'"),
+        ("origin_job_id", "TEXT"),
+        ("page_no", "INTEGER"),
+        ("cursor", "TEXT"),
+    ],
+    "backfill_jobs": [
+        ("page_size", "INTEGER NOT NULL DEFAULT 5"),
+    ],
+}
+
+
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, declaration in columns:
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                )
 
 
 def get_connection() -> sqlite3.Connection:
@@ -119,6 +196,7 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        _apply_column_migrations(conn)
     finally:
         conn.close()
 

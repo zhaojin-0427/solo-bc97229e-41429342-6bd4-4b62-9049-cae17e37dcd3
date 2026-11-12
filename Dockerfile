@@ -11,16 +11,22 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code and sample generator.
+# Application code, local source service and sample generator.
 COPY app ./app
+COPY source_app ./source_app
 COPY scripts ./scripts
 
-RUN mkdir -p /data/objects
+# Build the synthetic samples used by the upload demo and the immutable study
+# served by the local center-imaging source service.
+RUN python3 scripts/generate_samples.py /srv/samples/generated \
+    && python3 scripts/generate_samples.py --source-data /source-data/ \
+    && mkdir -p /data/objects
 
 # Run as a non-root user; the mounted volume is chowned at startup entrypoint.
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /srv /data /source-data
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh && chown -R appuser:appuser /srv /data
+RUN chmod +x /usr/local/bin/entrypoint.sh
 USER appuser
 
 EXPOSE 8000

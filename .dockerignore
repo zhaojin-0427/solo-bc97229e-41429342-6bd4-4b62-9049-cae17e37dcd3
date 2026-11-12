@@ -3,8 +3,10 @@ __pycache__/
 .pytest_cache/
 .git/
 data/
+source-data/
 .pylibs/
 tests/
 *.db
 *.db-wal
 *.db-shm
+.venv/

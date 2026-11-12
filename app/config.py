@@ -31,6 +31,19 @@ EXPLICIT_VR_LITTLE_ENDIAN = "1.2.840.10008.1.2.1"
 # SQLite busy timeout (milliseconds) for concurrent writers.
 BUSY_TIMEOUT_MS = int(os.getenv("DICOM_INGEST_BUSY_TIMEOUT_MS", "30000"))
 
+# Background backfill worker.
+BACKFILL_POLL_INTERVAL_S = float(
+    os.getenv("DICOM_INGEST_BACKFILL_POLL_INTERVAL_S", "0.25")
+)
+# Per-request timeout when talking to a remote manifest / file endpoint.
+BACKFILL_HTTP_TIMEOUT_S = float(
+    os.getenv("DICOM_INGEST_BACKFILL_HTTP_TIMEOUT_S", "30")
+)
+# Upper bound accepted on a remote manifest page size.
+BACKFILL_MAX_PAGE_SIZE = int(
+    os.getenv("DICOM_INGEST_BACKFILL_MAX_PAGE_SIZE", str(MAX_FILES_PER_BATCH))
+)
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

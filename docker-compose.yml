@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: dicom-ingest:1.0.0
+    image: dicom-ingest:1.1.0
     container_name: dicom-ingest-api
     ports:
       - "8000:8000"
@@ -12,8 +12,13 @@ services:
       DICOM_INGEST_DATA_DIR: /data
       DICOM_INGEST_MAX_FILES: "20"
       DICOM_INGEST_UID_ROOT: "2.25"
+      # In-container address of the local center-imaging source service.
+      DICOM_INGEST_BACKFILL_SOURCE_URL: http://dicom-source:8100
     volumes:
       - dicom-data:/data
+    depends_on:
+      dicom-source:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
       interval: 10s
@@ -22,6 +27,30 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # Local stand-in for the remote center-imaging service: cursor-paginated
+  # manifest, DICOM downloads and runtime fault injection.
+  dicom-source:
+    build:
+      context: .
+      dockerfile: Dockerfile.source
+    image: dicom-source:1.1.0
+    container_name: dicom-source
+    ports:
+      - "8100:8100"
+    environment:
+      SOURCE_SERVICE_DATA_DIR: /source-data
+    volumes:
+      - dicom-source-data:/source-data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
 volumes:
   dicom-data:
+    driver: local
+  dicom-source-data:
     driver: local

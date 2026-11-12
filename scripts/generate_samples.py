@@ -44,6 +44,13 @@ REF_SERIES_UID = "1.9.84.20261112.50.1"
 REF_TARGET_SOP_UID = "1.9.84.20261112.60.200"
 REF_STRUCT_SOP_UID = "1.9.84.20261112.60.201"
 
+# Backfill scenario: one study spanning several manifest pages (pages hold at
+# most 20 items). 45 CT images + 1 SR referencing the last image.
+BACKFILL_STUDY_UID = "1.9.84.20261112.80.1"
+BACKFILL_SERIES_UID = "1.9.84.20261112.81.1"
+BACKFILL_SR_SERIES_UID = "1.9.84.20261112.81.2"
+BACKFILL_IMAGE_COUNT = 45
+
 
 def _file_meta(sop_class_uid: str, sop_instance_uid: str) -> FileMetaDataset:
     meta = FileMetaDataset()
@@ -133,6 +140,31 @@ def make_sr_with_reference(
     return path
 
 
+def make_backfill_study(root: Path) -> None:
+    """Materialize the multi-page study served by the local source service."""
+    study_dir = root / "backfill_study"
+    sop_uids: list[str] = []
+    for index in range(BACKFILL_IMAGE_COUNT):
+        sop_uid = f"1.9.84.20261112.82.{index}"
+        sop_uids.append(sop_uid)
+        make_ct_image(
+            study_dir / f"image_{index:03d}.dcm",
+            study_uid=BACKFILL_STUDY_UID,
+            series_uid=BACKFILL_SERIES_UID,
+            sop_uid=sop_uid,
+            pixel_value=200 + index,
+        )
+    # An SR referencing the final image; the same nested-rewrite rules apply.
+    make_sr_with_reference(
+        study_dir / "struct_045.dcm",
+        study_uid=BACKFILL_STUDY_UID,
+        series_uid=BACKFILL_SR_SERIES_UID,
+        sop_uid="1.9.84.20261112.82.900",
+        referenced_sop_uid=sop_uids[-1],
+        referenced_series_uid=BACKFILL_SERIES_UID,
+    )
+
+
 def generate(root: Path) -> None:
     # --- Scenario 1: cross-center UID collision, different pixel bytes. ---
     make_ct_image(
@@ -172,13 +204,31 @@ def generate(root: Path) -> None:
     invalid.parent.mkdir(parents=True, exist_ok=True)
     invalid.write_bytes(b"this is definitely not a DICOM file\n" * 4)
 
+    # --- Scenario 4: multi-page study for background backfill. ---
+    make_backfill_study(root)
+
     for path in sorted(root.rglob("*")):
         if path.is_file():
             print(f"generated {path.relative_to(root)} ({path.stat().st_size} bytes)")
 
 
+def generate_source_data(root: Path) -> None:
+    """Layout the source-service volume: studies/<study>/*.dcm."""
+    make_backfill_study(root / "studies" / BACKFILL_STUDY_UID)
+    for path in sorted((root / "studies").rglob("*")):
+        if path.is_file():
+            print(f"source  {path.relative_to(root)} ({path.stat().st_size} bytes)")
+
+
 if __name__ == "__main__":
-    out_root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (
-        Path(__file__).resolve().parents[1] / "samples" / "generated"
-    )
-    generate(out_root)
+    args = sys.argv[1:]
+    if args and args[0] == "--source-data":
+        out_root = Path(args[1]).resolve() if len(args) > 1 else (
+            Path(__file__).resolve().parents[1] / "source-data"
+        )
+        generate_source_data(out_root)
+    else:
+        out_root = Path(args[0]).resolve() if args else (
+            Path(__file__).resolve().parents[1] / "samples" / "generated"
+        )
+        generate(out_root)

@@ -1,4 +1,4 @@
-"""HTTP API for multi-center DICOM ingestion.
+"""HTTP API for multi-center DICOM ingestion and background backfill.
 
 Endpoints
 ---------
@@ -8,6 +8,12 @@ GET  /api/v1/batches                 list batches (filter by center)
 GET  /api/v1/instances               search instances / inspect UID mapping
 GET  /api/v1/instances/{id}/download download the rewritten DICOM object
 GET  /api/v1/references/pending      reference-first bookkeeping per center
+POST /api/v1/backfills               submit a background backfill job
+GET  /api/v1/backfills               list backfill jobs
+GET  /api/v1/backfills/{job_id}      job progress and last error
+GET  /api/v1/backfills/{job_id}/attempts  page/error history
+POST /api/v1/backfills/{job_id}/resume   retry a paused/failed job
+POST /api/v1/backfills/{job_id}/pause    stop after the current page
 GET  /healthz                        liveness probe
 GET  /docs                           interactive Swagger UI
 """
@@ -17,19 +23,25 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import config
+from . import backfill, config
 from .config import MAX_FILE_BYTES, MAX_FILES_PER_BATCH
 from .db import get_connection, init_db
 from .service import IngestionError, UploadedFile, ingest_batch
+from .backfill import BackfillError
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Create / migrate the schema before accepting traffic.
     init_db()
-    yield
+    # Requeue jobs interrupted by a previous process and start the worker.
+    await backfill.worker.start()
+    try:
+        yield
+    finally:
+        await backfill.worker.stop()
 
 
 app = FastAPI(
@@ -72,6 +84,9 @@ class BatchSummary(BaseModel):
     status: str
     file_count: int
     reason: str | None
+    origin_kind: str = "upload"
+    origin_job_id: str | None = None
+    page_no: int | None = None
     created_at: str
 
 
@@ -191,7 +206,10 @@ def list_batches(
 ) -> list[BatchSummary]:
     conn = get_connection()
     try:
-        cols = "batch_id, center_id, status, file_count, reason, created_at"
+        cols = (
+            "batch_id, center_id, status, file_count, reason, origin_kind, "
+            "origin_job_id, page_no, created_at"
+        )
         if center_id:
             rows = conn.execute(
                 f"SELECT {cols} FROM batches WHERE center_id = ? "
@@ -315,3 +333,146 @@ def healthz() -> dict:
     finally:
         conn.close()
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# Background backfill
+# --------------------------------------------------------------------------- #
+class BackfillCreate(BaseModel):
+    center_id: str
+    original_study_uid: str
+    source_base_url: str
+    page_size: int = Field(default=5, ge=1, le=MAX_FILES_PER_BATCH)
+
+
+class BackfillJob(BaseModel):
+    job_id: str
+    center_id: str
+    original_study_uid: str
+    source_base_url: str
+    page_size: int
+    status: str
+    cursor: str
+    pages_committed: int
+    instances_committed: int
+    instances_reused: int
+    last_batch_id: str | None
+    last_error_code: str | None
+    last_error_message: str | None
+    last_error_at: str | None
+    created_at: str
+    updated_at: str
+
+
+class BackfillAttempt(BaseModel):
+    id: int
+    job_id: str
+    page_no: int
+    cursor: str
+    outcome: str
+    error_code: str | None
+    error_message: str | None
+    batch_id: str | None
+    item_count: int | None
+    reused_count: int | None
+    created_at: str
+
+
+def _raise_backfill(exc: BackfillError) -> None:
+    raise HTTPException(exc.http_status, {
+        "code": exc.code,
+        "message": str(exc),
+    }) from exc
+
+
+@app.post(
+    "/api/v1/backfills",
+    response_model=BackfillJob,
+    status_code=status.HTTP_201_CREATED,
+    tags=["backfills"],
+    summary="Submit a background backfill job for one remote study",
+)
+def create_backfill(payload: BackfillCreate) -> BackfillJob:
+    try:
+        row = backfill.create_job(
+            center_id=payload.center_id,
+            original_study_uid=payload.original_study_uid,
+            source_base_url=payload.source_base_url,
+            page_size=payload.page_size,
+        )
+    except BackfillError as exc:
+        _raise_backfill(exc)
+    return BackfillJob(**row)
+
+
+@app.get(
+    "/api/v1/backfills",
+    response_model=list[BackfillJob],
+    tags=["backfills"],
+    summary="List backfill jobs, optionally filtered by center",
+)
+def list_backfills(
+    center_id: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[BackfillJob]:
+    rows = backfill.list_jobs(center_id, limit, offset)
+    return [BackfillJob(**row) for row in rows]
+
+
+@app.get(
+    "/api/v1/backfills/{job_id}",
+    response_model=BackfillJob,
+    tags=["backfills"],
+    summary="Backfill job progress, cursor and last error",
+)
+def get_backfill(job_id: str) -> BackfillJob:
+    try:
+        row = backfill.get_job(job_id)
+    except BackfillError as exc:
+        _raise_backfill(exc)
+    return BackfillJob(**row)
+
+
+@app.get(
+    "/api/v1/backfills/{job_id}/attempts",
+    response_model=list[BackfillAttempt],
+    tags=["backfills"],
+    summary="Page attempt history (commits, pauses and retries)",
+)
+def get_backfill_attempts(
+    job_id: str, limit: int = Query(100, ge=1, le=500)
+) -> list[BackfillAttempt]:
+    try:
+        backfill.get_job(job_id)  # 404 early for unknown jobs
+    except BackfillError as exc:
+        _raise_backfill(exc)
+    return [BackfillAttempt(**row) for row in backfill.list_attempts(job_id, limit)]
+
+
+@app.post(
+    "/api/v1/backfills/{job_id}/resume",
+    response_model=BackfillJob,
+    tags=["backfills"],
+    summary="Resume a paused/failed job from its persisted cursor",
+)
+def resume_backfill(job_id: str) -> BackfillJob:
+    try:
+        row = backfill.request_resume(job_id)
+    except BackfillError as exc:
+        _raise_backfill(exc)
+    return BackfillJob(**row)
+
+
+@app.post(
+    "/api/v1/backfills/{job_id}/pause",
+    response_model=BackfillJob,
+    tags=["backfills"],
+    summary="Pause a job; the in-flight page still commits atomically",
+)
+def pause_backfill(job_id: str) -> BackfillJob:
+    try:
+        row = backfill.request_pause(job_id)
+    except BackfillError as exc:
+        _raise_backfill(exc)
+    return BackfillJob(**row)

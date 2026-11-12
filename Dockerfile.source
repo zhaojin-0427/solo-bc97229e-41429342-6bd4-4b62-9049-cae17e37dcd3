@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    SOURCE_SERVICE_DATA_DIR=/source-data
+
+WORKDIR /srv
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY source_app ./source_app
+COPY scripts ./scripts
+
+# Immutable study served through the cursor-paginated manifest.
+RUN python3 scripts/generate_samples.py --source-data /source-data/
+
+RUN useradd --create-home --uid 10002 sourceuser \
+    && chown -R sourceuser:sourceuser /srv /source-data
+USER sourceuser
+
+EXPOSE 8100
+
+CMD ["uvicorn", "source_app.main:app", "--host", "0.0.0.0", "--port", "8100"]
