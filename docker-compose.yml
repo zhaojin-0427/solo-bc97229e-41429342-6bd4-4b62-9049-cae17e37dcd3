@@ -1,0 +1,27 @@
+services:
+  dicom-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dicom-ingest:1.0.0
+    container_name: dicom-ingest-api
+    ports:
+      - "8000:8000"
+    environment:
+      # All state (SQLite DB + rewritten objects) lives in this mounted volume.
+      DICOM_INGEST_DATA_DIR: /data
+      DICOM_INGEST_MAX_FILES: "20"
+      DICOM_INGEST_UID_ROOT: "2.25"
+    volumes:
+      - dicom-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  dicom-data:
+    driver: local

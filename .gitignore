@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime state (Docker volume holds this in deployment)
+/data/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local virtualenv / target installs
+.venv/
+venv/
+.pylibs/
+
+# Editor / OS
+.DS_Store
+*.swp
